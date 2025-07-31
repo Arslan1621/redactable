@@ -1,254 +1,211 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 from src.simple_pii_detector import SimplePIIDetector
+from src.simple_redaction_engine import SimpleRedactionEngine
+import io
+import datetime
 
-redaction_bp = Blueprint('redaction', __name__)
+redaction_bp = Blueprint("redaction", __name__)
 
-# Initialize PII detector
+# Initialize PII detector and Redaction Engine
 pii_detector = SimplePIIDetector()
+redaction_engine = SimpleRedactionEngine()
 
-@redaction_bp.route('/analyze', methods=['POST'])
+# In-memory store for processed documents (temporary for session)
+# In a real production app, this would be a database or persistent storage
+processed_documents = {}
+
+@redaction_bp.route("/analyze", methods=["POST"])
 def analyze_text():
     """Analyze text for PII without file upload"""
     try:
         data = request.get_json()
         
-        if not data or 'text' not in data:
-            return jsonify({'error': 'Text is required'}), 400
+        if not data or "text" not in data:
+            return jsonify({"error": "Text is required"}), 400
         
-        text = data['text']
+        text = data["text"]
         if not text.strip():
-            return jsonify({'error': 'Text cannot be empty'}), 400
+            return jsonify({"error": "Text cannot be empty"}), 400
         
         # Perform PII analysis
         pii_analysis = pii_detector.generate_redaction_suggestions(text)
         
         return jsonify({
-            'success': True,
-            'analysis': pii_analysis
+            "success": True,
+            "analysis": pii_analysis
         }), 200
         
     except Exception as e:
         print(f"Text analysis error: {e}")
-        return jsonify({'error': 'Internal server error during text analysis'}), 500
+        return jsonify({"error": "Internal server error during text analysis"}), 500
 
-@redaction_bp.route('/preview', methods=['POST'])
+@redaction_bp.route("/preview", methods=["POST"])
 def preview_redaction():
-    """Preview text with suggested redactions applied"""
+    """Preview text with selected redactions applied"""
     try:
         data = request.get_json()
         
-        if not data or 'text' not in data:
-            return jsonify({'error': 'Text is required'}), 400
+        if not data or "text" not in data or "selected_detections" not in data:
+            return jsonify({"error": "Text and selected_detections are required"}), 400
         
-        text = data['text']
-        redaction_options = data.get('options', {})
+        text = data["text"]
+        selected_detections = data["selected_detections"]
+        redaction_options = data.get("redaction_options", {})
         
         if not text.strip():
-            return jsonify({'error': 'Text cannot be empty'}), 400
+            return jsonify({"error": "Text cannot be empty"}), 400
         
-        # Get PII detections
-        pii_analysis = pii_detector.generate_redaction_suggestions(text)
-        detections = pii_analysis['detections']
-        
-        # Apply redactions based on options
-        redacted_text = apply_redactions(text, detections, redaction_options)
+        # Apply redactions based on selected detections and options
+        redacted_text = redaction_engine.apply_redactions(
+            text, selected_detections, redaction_options
+        )
         
         return jsonify({
-            'success': True,
-            'original_text': text,
-            'redacted_text': redacted_text,
-            'redactions_applied': len([d for d in detections if should_redact(d, redaction_options)]),
-            'total_detections': len(detections)
+            "success": True,
+            "original_text": text,
+            "redacted_text": redacted_text,
+            "redactions_applied": len(selected_detections)
         }), 200
         
     except Exception as e:
         print(f"Redaction preview error: {e}")
-        return jsonify({'error': 'Internal server error during redaction preview'}), 500
+        return jsonify({"error": "Internal server error during redaction preview"}), 500
 
-def should_redact(detection, options):
-    """Determine if a detection should be redacted based on options"""
-    # Default redaction settings
-    default_settings = {
-        'redact_names': True,
-        'redact_emails': True,
-        'redact_phones': True,
-        'redact_ssns': True,
-        'redact_credit_cards': True,
-        'redact_organizations': False,
-        'redact_zip_codes': False,
-        'redact_dates': False,
-        'min_confidence': 0.5
-    }
-    
-    # Merge with user options
-    settings = {**default_settings, **options}
-    
-    # Check confidence threshold
-    if detection['confidence'] < settings['min_confidence']:
-        return False
-    
-    # Check type-specific settings
-    detection_type = detection['type']
-    type_mapping = {
-        'name': 'redact_names',
-        'email': 'redact_emails',
-        'phone': 'redact_phones',
-        'ssn': 'redact_ssns',
-        'credit_card': 'redact_credit_cards',
-        'organization': 'redact_organizations',
-        'zip_code': 'redact_zip_codes',
-        'date_of_birth': 'redact_dates'
-    }
-    
-    setting_key = type_mapping.get(detection_type)
-    if setting_key:
-        return settings.get(setting_key, False)
-    
-    return False
-
-def apply_redactions(text, detections, options):
-    """Apply redactions to text based on detections and options"""
-    if not detections:
-        return text
-    
-    # Filter detections based on options
-    to_redact = [d for d in detections if should_redact(d, options)]
-    
-    if not to_redact:
-        return text
-    
-    # Sort by start position in reverse order to maintain indices
-    to_redact.sort(key=lambda x: x['start'], reverse=True)
-    
-    redacted_text = text
-    redaction_char = options.get('redaction_char', '█')
-    
-    for detection in to_redact:
-        start = detection['start']
-        end = detection['end']
-        original_text = detection['text']
+@redaction_bp.route("/apply", methods=["POST"])
+def apply_redaction():
+    """Apply permanent redactions and make document available for download"""
+    try:
+        data = request.get_json()
         
-        # Create redaction replacement
-        if options.get('preserve_length', True):
-            # Replace with same length of redaction characters
-            replacement = redaction_char * len(original_text)
-        else:
-            # Replace with type indicator
-            type_labels = {
-                'name': '[NAME]',
-                'email': '[EMAIL]',
-                'phone': '[PHONE]',
-                'ssn': '[SSN]',
-                'credit_card': '[CREDIT_CARD]',
-                'organization': '[ORG]',
-                'zip_code': '[ZIP]',
-                'date_of_birth': '[DATE]'
-            }
-            replacement = type_labels.get(detection['type'], '[REDACTED]')
+        if not data or "file_id" not in data or "original_text" not in data or "selected_detections" not in data:
+            return jsonify({"error": "file_id, original_text, and selected_detections are required"}), 400
         
-        # Apply redaction
-        redacted_text = redacted_text[:start] + replacement + redacted_text[end:]
-    
-    return redacted_text
+        file_id = data["file_id"]
+        original_text = data["original_text"]
+        selected_detections = data["selected_detections"]
+        redaction_options = data.get("redaction_options", {})
+        original_filename = data.get("original_filename", "document.txt")
 
-@redaction_bp.route('/suggestions', methods=['POST'])
+        if not original_text.strip():
+            return jsonify({"error": "Original text cannot be empty"}), 400
+
+        redacted_text = redaction_engine.apply_redactions(
+            original_text, selected_detections, redaction_options
+        )
+
+        # Generate audit trail
+        audit_trail = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "original_filename": original_filename,
+            "redaction_options": redaction_options,
+            "selected_detections": selected_detections,
+            "redacted_length": len(redacted_text),
+            "original_length": len(original_text)
+        }
+
+        # Store redacted content and audit trail in-memory for download
+        processed_documents[file_id] = {
+            "redacted_text": redacted_text,
+            "audit_trail": audit_trail,
+            "original_filename": original_filename
+        }
+
+        return jsonify({
+            "success": True,
+            "redaction_id": file_id,
+            "redacted_text_preview": redacted_text[:200] + "..." if len(redacted_text) > 200 else redacted_text,
+            "message": "Redaction applied and ready for download"
+        }), 200
+
+    except Exception as e:
+        print(f"Apply redaction error: {e}")
+        return jsonify({"error": "Internal server error during redaction application"}), 500
+
+@redaction_bp.route("/download/<file_id>", methods=["GET"])
+def download_redacted_document(file_id):
+    """Download the redacted document"""
+    try:
+        if file_id not in processed_documents:
+            return jsonify({"error": "Redacted document not found or expired"}), 404
+        
+        doc_data = processed_documents[file_id]
+        redacted_text = doc_data["redacted_text"]
+        original_filename = doc_data["original_filename"]
+
+        # Create a file-like object in memory
+        output = io.BytesIO(redacted_text.encode("utf-8"))
+        output.seek(0)
+
+        # Clean up the in-memory store after download (optional, but good for memory management)
+        # del processed_documents[file_id]
+
+        return send_file(
+            output,
+            mimetype="text/plain",
+            as_attachment=True,
+            download_name=f"redacted_{original_filename.replace(".txt", "").replace(".pdf", "")}_{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}.txt"
+        )
+
+    except Exception as e:
+        print(f"Download error: {e}")
+        return jsonify({"error": "Internal server error during download"}), 500
+
+@redaction_bp.route("/download_audit/<file_id>", methods=["GET"])
+def download_audit_trail(file_id):
+    """Download the audit trail for a redacted document"""
+    try:
+        if file_id not in processed_documents:
+            return jsonify({"error": "Audit trail not found or expired"}), 404
+        
+        doc_data = processed_documents[file_id]
+        audit_trail = doc_data["audit_trail"]
+        original_filename = doc_data["original_filename"]
+
+        # Create a file-like object in memory for the JSON audit trail
+        output = io.BytesIO(jsonify(audit_trail).data)
+        output.seek(0)
+
+        return send_file(
+            output,
+            mimetype="application/json",
+            as_attachment=True,
+            download_name=f"audit_{original_filename.replace(".txt", "").replace(".pdf", "")}_{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}.json"
+        )
+
+    except Exception as e:
+        print(f"Audit download error: {e}")
+        return jsonify({"error": "Internal server error during audit trail download"}), 500
+
+@redaction_bp.route("/suggestions", methods=["POST"])
 def get_redaction_suggestions():
     """Get intelligent redaction suggestions based on document type and content"""
     try:
         data = request.get_json()
         
-        if not data or 'text' not in data:
-            return jsonify({'error': 'Text is required'}), 400
+        if not data or "text" not in data:
+            return jsonify({"error": "Text is required"}), 400
         
-        text = data['text']
-        document_type = data.get('document_type', 'general')
+        text = data["text"]
+        document_type = data.get("document_type", "general")
         
         if not text.strip():
-            return jsonify({'error': 'Text cannot be empty'}), 400
+            return jsonify({"error": "Text cannot be empty"}), 400
         
         # Get PII analysis
         pii_analysis = pii_detector.generate_redaction_suggestions(text)
         
         # Generate context-aware suggestions
-        smart_suggestions = generate_smart_suggestions(pii_analysis, document_type, text)
+        smart_suggestions = redaction_engine.generate_smart_suggestions(pii_analysis, document_type, text)
         
         return jsonify({
-            'success': True,
-            'pii_analysis': pii_analysis,
-            'smart_suggestions': smart_suggestions
+            "success": True,
+            "pii_analysis": pii_analysis,
+            "smart_suggestions": smart_suggestions
         }), 200
         
     except Exception as e:
         print(f"Suggestions error: {e}")
-        return jsonify({'error': 'Internal server error during suggestion generation'}), 500
+        return jsonify({"error": "Internal server error during suggestion generation"}), 500
 
-def generate_smart_suggestions(pii_analysis, document_type, text):
-    """Generate intelligent redaction suggestions based on context"""
-    detections = pii_analysis['detections']
-    suggestions = []
-    
-    if not detections:
-        return {
-            'recommended_settings': {
-                'redact_names': False,
-                'redact_emails': False,
-                'redact_phones': False,
-                'redact_ssns': False,
-                'min_confidence': 0.5
-            },
-            'reasoning': ['No sensitive information detected in this document.'],
-            'risk_level': 'low'
-        }
-    
-    # Analyze risk level
-    high_risk_types = ['ssn', 'credit_card']
-    medium_risk_types = ['email', 'phone', 'name']
-    
-    high_risk_count = len([d for d in detections if d['type'] in high_risk_types])
-    medium_risk_count = len([d for d in detections if d['type'] in medium_risk_types])
-    
-    if high_risk_count > 0:
-        risk_level = 'high'
-    elif medium_risk_count > 2:
-        risk_level = 'medium'
-    else:
-        risk_level = 'low'
-    
-    # Generate recommendations based on document type and risk
-    recommended_settings = {
-        'redact_names': True,
-        'redact_emails': True,
-        'redact_phones': True,
-        'redact_ssns': True,
-        'redact_credit_cards': True,
-        'redact_organizations': False,
-        'redact_zip_codes': False,
-        'redact_dates': False,
-        'min_confidence': 0.7 if risk_level == 'high' else 0.5
-    }
-    
-    reasoning = []
-    
-    if document_type == 'medical':
-        recommended_settings['redact_dates'] = True
-        reasoning.append("Medical documents typically require redaction of dates and personal identifiers.")
-    elif document_type == 'financial':
-        recommended_settings['redact_zip_codes'] = True
-        reasoning.append("Financial documents should have all personal and location data redacted.")
-    elif document_type == 'legal':
-        recommended_settings['redact_organizations'] = True
-        reasoning.append("Legal documents may require redaction of organization names for confidentiality.")
-    
-    if high_risk_count > 0:
-        reasoning.append(f"High-risk information detected ({high_risk_count} items). Recommend strict redaction settings.")
-    
-    if len(detections) > 5:
-        reasoning.append("Multiple sensitive items detected. Consider comprehensive redaction.")
-    
-    return {
-        'recommended_settings': recommended_settings,
-        'reasoning': reasoning,
-        'risk_level': risk_level,
-        'priority_items': [d for d in detections if d['confidence'] >= 0.8]
-    }
+
 
